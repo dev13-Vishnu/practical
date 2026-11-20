@@ -9,11 +9,30 @@ const bookSchema = new mongoose.Schema(
     author: { type: String, required: true, trim: true },
     year: { type: Number, required: true },
     available: { type: Boolean, default: true },
-  },
-  { timestamps: true }
+},
+{ timestamps: true }
 );
 
 const Book = mongoose.model('Book', bookSchema);
+
+const userSchema = new mongoose.Schema(
+    {
+        email: {
+            type: String,
+            required: true,
+            unique: true,
+            lowercase: true,
+            trim: true,
+        },
+        passwordHash: {
+            type: String,
+            required: true,
+        },
+    },
+    { timestamps: true }
+)
+
+const User = mongoose.model('User', userSchema);
 
 async function connectDB() {
   await mongoose.connect(MONGO_URI);
@@ -31,4 +50,4 @@ async function connectDB() {
   }
 }
 
-module.exports = { connectDB, Book };
+module.exports = { connectDB, Book, User };

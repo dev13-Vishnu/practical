@@ -1,6 +1,12 @@
 const express = require("express");
-const { connectDB, Book } = require("./db");
+const { connectDB, Book, User } = require("./db");
 const { default: mongoose } = require("mongoose");
+const bcrypt  = require('bcrypt');
+const jwt = require('jsonwebtoken');
+
+require('dotenv').config()
+
+
 const app = express();
 
 const PORT = 3000;
@@ -357,7 +363,181 @@ app.patch('/books/:id', async (req, res) => {
   res.status(200).json(updatedBook);
 });
 
+// Bonus Challenge: Atomic Deletion (DELETE /books/:id)
+// Scenario: Librarians need to permanently remove lost or damaged books from the MongoDB catalog. Unlike your Milestone 3 array version—where you checked .some() and then ran .filter()—doing two separate database trips (find then delete) introduces extra latency and a subtle race condition if two requests try to delete the same book at the exact same millisecond.
 
+// Goal:
+
+// Create an async route at DELETE /books/:id.
+
+// Validate that req.params.id is a valid MongoDB ObjectId. If not, return 400 with { "error": "Invalid book ID" }.
+
+// Delete the matching document from MongoDB in a single atomic Mongoose query (do not query twice).
+
+// If no document matched that ID, return 404 with { "error": "Book not found" }.
+
+// If deletion succeeds, return 200 with:
+
+// JSON
+// {
+//   "message": "Book deleted successfully",
+//   "deletedBook": { ... }
+// }
+// Edge Cases to Test in frontend.js:
+
+// Send DELETE /books/not-an-id — should return 400.
+
+// Send DELETE /books/<real_id> — should return 200 along with the deleted document.
+
+// Send the exact same DELETE /books/<real_id> a second time — should return 404.
+
+app.delete('/books/:id', async (req, res) => {
+  const { id } = req.params;
+
+  // 1. Strictly verify 24-char hex format (even safer than isValidObjectId,
+  // which falsely accepts arbitrary 12-character strings like "abcdefghijkl").
+  if (!mongoose.isObjectIdOrHexString(id)) {
+    return res.status(400).json({ error: 'Invalid book ID' });
+  }
+
+  // 2. Atomic single-trip delete: finds AND removes the document in one DB call,
+  // avoiding race conditions between concurrent DELETE requests.
+  const deletedBook = await Book.findByIdAndDelete(id);
+
+  // 3. Always check for `null`—otherwise deleting a missing or already-deleted
+  // book silently returns `200 OK` with `null` instead of `404 Not Found`.
+  if (!deletedBook) {
+    return res.status(404).json({ error: 'Book not found' });
+  }
+
+  // 4. Confirm deletion and return the removed document (useful for "Undo" UIs or audit logs).
+  res.status(200).json({
+    message: 'Book deleted successfully',
+    deletedBook,
+  });
+});
+
+// ==========================================
+// MILESTONE 5 CHALLENGES GO HERE
+// ==========================================
+
+//Challenge 1...
+const JWT_SECRET = process.env.JWT_SECRET
+const SALT_ROUNDS = 12;
+
+function isValidEmail(email) {
+  if (typeof email !== 'string') return false;
+  const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+  return emailRegex.test(email.trim());
+}
+
+function isValidPassword(password) {
+  // At least 8 chars, 1 lowercase, 1 uppercase, 1 digit, 1 special char (broad set)
+  const passwordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z\d]).{8,}$/;
+  return typeof password === 'string' && passwordRegex.test(password);
+}
+
+// ==========================================
+// CHALLENGE 1: Register
+// ==========================================
+app.post('/auth/register', async (req, res) => {
+  const { email, password } = req.body || {};
+
+  if (!isValidEmail(email)) {
+    return res.status(400).json({ error: 'Please provide a valid email address' });
+  }
+
+  if (!isValidPassword(password)) {
+    return res.status(400).json({
+      error:
+        'Password must be at least 8 characters and include uppercase, lowercase, a number, and a symbol',
+    });
+  }
+
+  const normalizedEmail = email.trim().toLowerCase();
+
+  const existingUser = await User.findOne({ email: normalizedEmail });
+  if (existingUser) {
+    return res.status(409).json({ error: 'Email already registered' });
+  }
+
+  // Always `await` bcrypt.hash
+  const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
+
+  const user = await User.create({
+    email: normalizedEmail,
+    passwordHash,
+  });
+
+  // Never expose passwordHash in the response
+  res.status(201).json({
+    id: user._id,
+    email: user.email,
+  });
+});
+
+// ==========================================
+// CHALLENGE 2: Login & JWT Issuance
+// ==========================================
+app.post('/auth/login', async (req, res) => {
+  const { email, password } = req.body || {};
+
+  // Only validate basic presence/types on login (not registration password rules)
+  if (!isValidEmail(email) || typeof password !== 'string' || !password) {
+    return res.status(400).json({ error: 'Valid email and password are required' });
+  }
+
+  const normalizedEmail = email.trim().toLowerCase();
+  const user = await User.findOne({ email: normalizedEmail });
+
+  // Prevent user enumeration: same 401 message whether email or password is wrong
+  const isPasswordValid = user
+    ? await bcrypt.compare(password, user.passwordHash)
+    : false;
+
+  if (!isPasswordValid) {
+    return res.status(401).json({ error: 'Invalid email or password' });
+  }
+
+  const payload = { userId: user._id.toString(), email: user.email };
+  const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '1h' });
+
+  res.status(200).json({ token });
+});
+
+// ==========================================
+// CHALLENGE 3: Auth Middleware & Protected Routes
+// ==========================================
+function authenticate(req, res, next) {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+
+  const token = authHeader.slice(7).trim();
+  if (!token) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+
+  try {
+    // Synchronous verify inside try/catch avoids callback flow bugs
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded; // Attach decoded identity to req for downstream handlers
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
+
+// Protected profile route (excludes passwordHash at the DB query level)
+app.get('/auth/me', authenticate, async (req, res) => {
+  const user = await User.findById(req.user.userId).select('-passwordHash');
+  if (!user) {
+    return res.status(404).json({ error: 'User not found' });
+  }
+  res.status(200).json(user);
+});
 // ==========================================
 // MILESTONE 2 CHALLENGES GO HERE
 // ==========================================
